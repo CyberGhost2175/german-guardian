@@ -131,7 +131,7 @@ async def handle_update(data: dict):
         )
 
         # Вызываем логику проверки
-        from check import run_check
+        from api.check import run_check
         result = run_check()
 
         if result.get("status") == "initialized":
