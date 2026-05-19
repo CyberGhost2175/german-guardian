@@ -1,5 +1,5 @@
 """
-Telegram Bot Webhook — принимает команды от пользователя
+Telegram Bot Webhook — мультипользовательский
 POST /api/webhook
 """
 
@@ -15,9 +15,8 @@ from telegram.constants import ParseMode
 
 log = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-REDIS_URL        = os.environ["REDIS_URL"]
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+REDIS_URL      = os.environ["REDIS_URL"]
 
 def get_redis():
     return redis.from_url(REDIS_URL, decode_responses=True)
@@ -31,11 +30,10 @@ async def handle_update(data: dict):
     chat_id = str(message["chat"]["id"])
     text = message.get("text", "").strip()
 
-    if chat_id != TELEGRAM_CHAT_ID:
-        await bot.send_message(chat_id=chat_id, text="⛔ Нет доступа")
-        return
-
     r = get_redis()
+
+    key_target = f"target:{chat_id}"
+    key_db     = f"following:{chat_id}"
 
     if text == "/start":
         await bot.send_message(
@@ -59,14 +57,14 @@ async def handle_update(data: dict):
             return
 
         username = parts[1].lstrip("@").lower()
-        current = r.get("target_username")
+        current = r.get(key_target)
 
         if current == username:
             await bot.send_message(chat_id=chat_id, text=f"ℹ️ Уже слежу за @{username}")
             return
 
-        r.set("target_username", username)
-        r.delete("following_db")
+        r.set(key_target, username)
+        r.delete(key_db)
 
         await bot.send_message(
             chat_id=chat_id,
@@ -79,8 +77,8 @@ async def handle_update(data: dict):
         )
 
     elif text == "/status":
-        target = r.get("target_username")
-        db_json = r.get("following_db")
+        target = r.get(key_target)
+        db_json = r.get(key_db)
         count = len(json.loads(db_json)) if db_json else 0
 
         if target:
@@ -101,16 +99,16 @@ async def handle_update(data: dict):
             )
 
     elif text == "/stop":
-        target = r.get("target_username")
+        target = r.get(key_target)
         if target:
-            r.delete("target_username")
-            r.delete("following_db")
+            r.delete(key_target)
+            r.delete(key_db)
             await bot.send_message(chat_id=chat_id, text=f"⏹ Остановил слежку за @{target}")
         else:
             await bot.send_message(chat_id=chat_id, text="ℹ️ Слежка и так не запущена")
 
     elif text == "/check":
-        target = r.get("target_username")
+        target = r.get(key_target)
         if not target:
             await bot.send_message(chat_id=chat_id, text="❌ Сначала укажи username через /track")
             return
@@ -120,9 +118,9 @@ async def handle_update(data: dict):
             text=f"🔄 Запускаю проверку @{target}..."
         )
 
-        from api.check import run_check
+        from api.check import run_check_for_user
         with concurrent.futures.ThreadPoolExecutor() as pool:
-            result = pool.submit(run_check).result()
+            result = pool.submit(run_check_for_user, chat_id, target).result()
 
         if result.get("status") == "initialized":
             await bot.send_message(

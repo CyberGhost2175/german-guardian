@@ -1,7 +1,6 @@
 """
 Instagram Following Tracker — Vercel Cron Handler
-Запускается каждые 2 часа через Vercel Cron Jobs
-POST /api/check
+Запускается каждые 2 часа через cron-job.org
 """
 
 import os
@@ -16,12 +15,11 @@ import redis
 
 log = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-INSTA_LOGIN      = os.environ["INSTA_LOGIN"]
-INSTA_PASSWORD   = os.environ["INSTA_PASSWORD"]
-REDIS_URL        = os.environ["REDIS_URL"]
-CRON_SECRET      = os.environ.get("CRON_SECRET", "")
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+INSTA_LOGIN    = os.environ["INSTA_LOGIN"]
+INSTA_PASSWORD = os.environ["INSTA_PASSWORD"]
+REDIS_URL      = os.environ["REDIS_URL"]
+CRON_SECRET    = os.environ.get("CRON_SECRET", "")
 
 def get_redis():
     return redis.from_url(REDIS_URL, decode_responses=True)
@@ -59,14 +57,14 @@ def get_following(cl: Client, username: str) -> dict:
     log.info(f"Получено {len(result)} подписок у @{username}")
     return result
 
-async def send_new_followings(new_users: list, target: str):
+async def send_new_followings(chat_id: str, new_users: list, target: str):
     bot = Bot(token=TELEGRAM_TOKEN)
     header = (
         f"👀 <b>Новые подписки @{target}</b>\n"
         f"Найдено: <b>{len(new_users)}</b> новых\n"
         f"{'─' * 25}"
     )
-    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=header, parse_mode=ParseMode.HTML)
+    await bot.send_message(chat_id=chat_id, text=header, parse_mode=ParseMode.HTML)
 
     for user in new_users:
         username = user["username"]
@@ -79,58 +77,95 @@ async def send_new_followings(new_users: list, target: str):
         )
         try:
             if pic_url:
-                await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=pic_url,
+                await bot.send_photo(chat_id=chat_id, photo=pic_url,
                                      caption=caption, parse_mode=ParseMode.HTML)
             else:
-                await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=caption,
+                await bot.send_message(chat_id=chat_id, text=caption,
                                        parse_mode=ParseMode.HTML)
         except Exception as e:
             log.warning(f"Фото не отправилось для @{username}: {e}")
-            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=caption,
-                                   parse_mode=ParseMode.HTML)
+            await bot.send_message(chat_id=chat_id, text=caption, parse_mode=ParseMode.HTML)
         await asyncio.sleep(0.5)
 
-async def send_message(text: str):
+async def send_message(chat_id: str, text: str):
     bot = Bot(token=TELEGRAM_TOKEN)
-    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode=ParseMode.HTML)
+    await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
 
-def run_check() -> dict:
+def run_check_for_user(chat_id: str, target: str) -> dict:
+    """Проверка для конкретного пользователя (вызывается из webhook /check)"""
     r = get_redis()
-
-    target = r.get("target_username")
-    if not target:
-        log.info("Таргет не задан, пропускаем")
-        return {"status": "no_target"}
-
-    log.info(f"🔄 Проверяю подписки @{target}...")
+    key_db = f"following:{chat_id}"
 
     cl = get_instagram_client()
     current = get_following(cl, target)
-    saved_json = r.get("following_db")
+    saved_json = r.get(key_db)
     saved = json.loads(saved_json) if saved_json else {}
 
     if not saved:
-        r.set("following_db", json.dumps(current))
+        r.set(key_db, json.dumps(current))
         count = len(current)
-        log.info(f"Первый запуск: сохранено {count} подписок")
         asyncio.run(send_message(
+            chat_id,
             f"📦 <b>База инициализирована</b>\n"
             f"Слежу за <b>@{target}</b>\n"
-            f"Сохранено подписок: <b>{count}</b>\n"
-            f"Теперь буду присылать новые!"
+            f"Сохранено подписок: <b>{count}</b>"
         ))
         return {"status": "initialized", "count": count}
 
     new_ids = set(current.keys()) - set(saved.keys())
     if new_ids:
         new_users = [current[uid] for uid in new_ids]
-        log.info(f"🆕 Найдено {len(new_users)} новых подписок")
-        asyncio.run(send_new_followings(new_users, target))
-    else:
-        log.info("Новых подписок нет")
+        asyncio.run(send_new_followings(chat_id, new_users, target))
 
-    r.set("following_db", json.dumps(current))
+    r.set(key_db, json.dumps(current))
     return {"status": "ok", "new": len(new_ids)}
+
+def run_check_all() -> dict:
+    """Крон — проверяет всех пользователей у кого есть таргет"""
+    r = get_redis()
+    keys = r.keys("target:*")
+
+    if not keys:
+        log.info("Нет активных пользователей")
+        return {"status": "no_users"}
+
+    cl = get_instagram_client()
+    total_new = 0
+
+    for key in keys:
+        chat_id = key.split(":", 1)[1]
+        target = r.get(key)
+        if not target:
+            continue
+
+        try:
+            log.info(f"Проверяю @{target} для {chat_id}")
+            key_db = f"following:{chat_id}"
+            current = get_following(cl, target)
+            saved_json = r.get(key_db)
+            saved = json.loads(saved_json) if saved_json else {}
+
+            if not saved:
+                r.set(key_db, json.dumps(current))
+                asyncio.run(send_message(
+                    chat_id,
+                    f"📦 База инициализирована для <b>@{target}</b>\n"
+                    f"Сохранено: <b>{len(current)}</b> подписок"
+                ))
+                continue
+
+            new_ids = set(current.keys()) - set(saved.keys())
+            if new_ids:
+                new_users = [current[uid] for uid in new_ids]
+                asyncio.run(send_new_followings(chat_id, new_users, target))
+                total_new += len(new_ids)
+
+            r.set(key_db, json.dumps(current))
+
+        except Exception as e:
+            log.error(f"Ошибка для {chat_id}/@{target}: {e}")
+
+    return {"status": "ok", "total_new": total_new}
 
 
 class handler(BaseHTTPRequestHandler):
@@ -143,7 +178,7 @@ class handler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = run_check()
+            result = run_check_all()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
